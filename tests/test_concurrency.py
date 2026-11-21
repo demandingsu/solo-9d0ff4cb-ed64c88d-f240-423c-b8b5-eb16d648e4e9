@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -58,3 +59,66 @@ def test_concurrent_compatible_reports_all_accepted(tmp_path):
         ).json()
         assert bounds["min_count"] == 10
         assert bounds["max_count"] == 10
+
+
+def test_interleaved_reads_and_writes_see_consistent_snapshots(tmp_path):
+    """查询与写入交错：每个响应的总片数与上下界须来自同一份已提交数据。
+
+    总片数在 100 与 60 之间来回更正；[0,50) 恒为 60 片。对查询 [50,100)：
+    数据版本 A（total=100）应答 (0, 40)，数据版本 B（total=60）应答 (0, 0)。
+    任何混装（如 total=100 却答 max=0）都说明响应拼合了不同快照。
+    """
+    app = create_app(str(tmp_path / "interleave.db"))
+    with TestClient(app) as client:
+        assert client.post("/inspections", json={"total_pieces": 100}).status_code == 201
+        assert (
+            client.post(
+                "/inspections/1/reports",
+                json={"segments": [{"lo": 0, "hi": 50, "count": 60}]},
+            ).status_code
+            == 201
+        )
+
+        stop = threading.Event()
+        failures = []
+
+        def writer():
+            totals = [60, 100]
+            i = 0
+            while not stop.is_set():
+                resp = client.patch(
+                    "/inspections/1", json={"total_pieces": totals[i % 2]}
+                )
+                if resp.status_code != 200:
+                    failures.append(("patch", resp.status_code, resp.text))
+                    return
+                i += 1
+
+        def reader():
+            for _ in range(200):
+                resp = client.get(
+                    "/inspections/1/bounds",
+                    params={"qualified_lo": 50, "qualified_hi": 100},
+                )
+                if resp.status_code != 200:
+                    failures.append(("get", resp.status_code, resp.text))
+                    return
+                body = resp.json()
+                snapshot = (
+                    body["total_pieces"],
+                    body["min_count"],
+                    body["max_count"],
+                )
+                if snapshot not in ((100, 0, 40), (60, 0, 0)):
+                    failures.append(("mixed", body))
+                    return
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            writer_future = pool.submit(writer)
+            readers = [pool.submit(reader) for _ in range(2)]
+            for future in readers:
+                future.result()
+            stop.set()
+            writer_future.result()
+
+        assert failures == []

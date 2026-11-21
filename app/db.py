@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS inspections (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     total_pieces  INTEGER NOT NULL CHECK (total_pieces >= 0),
     note          TEXT,
+    revision      INTEGER NOT NULL DEFAULT 0,
     created_at    TEXT NOT NULL
 );
 
@@ -62,8 +63,24 @@ def init(path: str) -> None:
     try:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(SCHEMA)
+        _migrate(connection)
     finally:
         connection.close()
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """为既有数据库补齐后加的列（CREATE TABLE IF NOT EXISTS 不会改旧表）。
+
+    ``revision`` 是界限计算所依赖数据的版本号：只随已提交的、影响上下界
+    的写入（接收补报、更正总片数）递增；写入被拒回滚时不变。
+    """
+    columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(inspections)")
+    }
+    if "revision" not in columns:
+        connection.execute(
+            "ALTER TABLE inspections ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def now() -> str:
@@ -114,11 +131,38 @@ def update_inspection(
     inspection_id: int,
     total_pieces: int,
     note: str | None,
+    bump_revision: bool,
 ) -> None:
-    connection.execute(
-        "UPDATE inspections SET total_pieces = ?, note = ? WHERE id = ?",
-        (total_pieces, note, inspection_id),
-    )
+    """更正登记；``bump_revision`` 为真时同时递增数据版本号。
+
+    总片数变化会影响界限计算结果，调用方据此决定是否递增版本；
+    仅改备注不影响上下界，不必作废旧计算。
+    """
+    if bump_revision:
+        connection.execute(
+            "UPDATE inspections SET total_pieces = ?, note = ?, "
+            "revision = revision + 1 WHERE id = ?",
+            (total_pieces, note, inspection_id),
+        )
+    else:
+        connection.execute(
+            "UPDATE inspections SET total_pieces = ?, note = ? WHERE id = ?",
+            (total_pieces, note, inspection_id),
+        )
+
+
+def get_data_state(
+    connection: sqlite3.Connection, inspection_id: int
+) -> sqlite3.Row | None:
+    """读取界限查询所需的数据状态：总片数 + 数据版本号。
+
+    供 /bounds 在同一个读事务里确定缓存键，保证响应中的总片数与上下界
+    来自同一份已提交数据。
+    """
+    return connection.execute(
+        "SELECT id, total_pieces, revision FROM inspections WHERE id = ?",
+        (inspection_id,),
+    ).fetchone()
 
 
 def load_constraints(
@@ -147,6 +191,12 @@ def insert_report(
         VALUES (?, ?, ?, ?, ?)
         """,
         [(report_id, inspection_id, lo, hi, count) for lo, hi, count in segments],
+    )
+    # 接收补报会改变界限计算所依赖的数据，递增版本号（与写入同一事务，
+    # 要么一起提交，要么一起回滚）。
+    connection.execute(
+        "UPDATE inspections SET revision = revision + 1 WHERE id = ?",
+        (inspection_id,),
     )
     return report_id
 

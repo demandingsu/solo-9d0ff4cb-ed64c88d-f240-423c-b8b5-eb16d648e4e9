@@ -15,9 +15,11 @@
 from __future__ import annotations
 
 import os
+import threading
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from sqlite3 import Connection
 
 from . import db
@@ -30,13 +32,57 @@ from .schemas import (
     InspectionSummary,
     InspectionUpdate,
 )
-from .solver import InconsistentCounts, check_consistent, compute_bounds
+from .solver import BoundsIndex, InconsistentCounts, check_consistent
 
 DEFAULT_DB_PATH = os.environ.get("DB_PATH", "./data/inspection.db")
+DEFAULT_CACHE_CAPACITY = 32
 
 
-def create_app(db_path: str | None = None) -> FastAPI:
+class BoundsCache:
+    """有界 LRU 缓存：``(登记 id, 数据版本, 合格下限) -> BoundsIndex``。
+
+    * 合格上限不在键里：同一批数据、同一下限换上限时命中同一份索引，
+      直接复用已算好的两趟最短路结果，内存不随查过的上限数量增长；
+    * 容量有界，超出按最近最少使用淘汰，内存也不随查过的下限/批次
+      数量无限增长；
+    * 键含数据版本号：补报或总片数更正提交后版本递增，新查询自然
+      未命中并用新数据重建；写入被拒回滚时版本不变，旧索引继续命中。
+    """
+
+    def __init__(self, capacity: int = DEFAULT_CACHE_CAPACITY) -> None:
+        self._capacity = max(1, int(capacity))
+        self._entries: OrderedDict[tuple[int, int, int], BoundsIndex] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key: tuple[int, int, int]) -> BoundsIndex | None:
+        with self._lock:
+            try:
+                entry = self._entries.pop(key)
+            except KeyError:
+                return None
+            self._entries[key] = entry  # 移到末尾：最近使用
+            return entry
+
+    def put(self, key: tuple[int, int, int], entry: BoundsIndex) -> None:
+        with self._lock:
+            self._entries.pop(key, None)
+            self._entries[key] = entry
+            while len(self._entries) > self._capacity:
+                self._entries.popitem(last=False)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+
+def create_app(db_path: str | None = None, cache_capacity: int | None = None) -> FastAPI:
     path = db_path or DEFAULT_DB_PATH
+    capacity = (
+        cache_capacity
+        if cache_capacity is not None
+        else int(os.environ.get("BOUNDS_CACHE_CAPACITY", DEFAULT_CACHE_CAPACITY))
+    )
+    bounds_cache = BoundsCache(capacity)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -52,6 +98,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         version="1.0.0",
         lifespan=lifespan,
     )
+    api.state.bounds_cache = bounds_cache
 
     def get_conn():
         connection = db.connect(path)
@@ -159,7 +206,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
                             "本次更正已拒收，原登记保持不变"
                         ),
                     )
-            db.update_inspection(connection, inspection_id, new_total, new_note)
+            # 总片数实际变化才递增数据版本（仅改备注不影响上下界计算）
+            total_changed = new_total != int(row["total_pieces"])
+            db.update_inspection(
+                connection, inspection_id, new_total, new_note, total_changed
+            )
             connection.execute("COMMIT")
         except HTTPException:
             connection.execute("ROLLBACK")
@@ -241,10 +292,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "合格区间为 [qualified_lo, qualified_hi)，整数微米，含起点不含终点。"
             "返回值是同时满足全部已接收计数时，合格片数可同时达到的最小值和最大值；"
             "不逐片展开，按端点划分的整数规划精确求解。"
+            "同一批数据、同一下限重复查询（只换上限）时复用已建索引，"
+            "响应头 X-Bounds-Cache 标示 hit/miss。"
         ),
     )
     def get_bounds(
         inspection_id: int,
+        response: Response,
         qualified_lo: int = Query(..., ge=0, description="合格区间起点，包含"),
         qualified_hi: int = Query(..., description="合格区间终点，不包含，须大于起点"),
         connection: Connection = Depends(get_conn),
@@ -254,21 +308,47 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 status_code=422,
                 detail="qualified_hi 必须大于 qualified_lo（区间含起点、不含终点）",
             )
-        row = _require_inspection(connection, inspection_id)
-        constraints = db.load_constraints(connection, inspection_id)
+        # 显式读事务：版本号、总片数与（未命中时的）全部计数来自同一份
+        # 已提交快照；响应里的总片数与上下界因此始终对应同一份数据。
+        connection.execute("BEGIN")
         try:
-            min_count, max_count = compute_bounds(
-                int(row["total_pieces"]), constraints, qualified_lo, qualified_hi
-            )
-        except InconsistentCounts as exc:
-            # 正常写入路径会拒绝不相容数据；此处防御数据库被外部改写。
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="已存计数互相矛盾，无法计算；请检查数据",
-            ) from exc
+            state = db.get_data_state(connection, inspection_id)
+            if state is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"登记 {inspection_id} 不存在",
+                )
+            total = int(state["total_pieces"])
+            revision = int(state["revision"])
+            key = (inspection_id, revision, qualified_lo)
+            index = bounds_cache.get(key)
+            constraints = None
+            if index is None:
+                constraints = db.load_constraints(connection, inspection_id)
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+        if index is None:
+            cache_state = "miss"
+            try:
+                index = BoundsIndex(total, constraints, qualified_lo)
+            except InconsistentCounts as exc:
+                # 正常写入路径会拒绝不相容数据；此处防御数据库被外部改写。
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="已存计数互相矛盾，无法计算；请检查数据",
+                ) from exc
+            bounds_cache.put(key, index)
+        else:
+            cache_state = "hit"
+
+        min_count, max_count = index.query(qualified_hi)
+        response.headers["X-Bounds-Cache"] = cache_state
         return BoundsOut(
             inspection_id=inspection_id,
-            total_pieces=int(row["total_pieces"]),
+            total_pieces=total,
             qualified_lo=qualified_lo,
             qualified_hi=qualified_hi,
             min_count=min_count,

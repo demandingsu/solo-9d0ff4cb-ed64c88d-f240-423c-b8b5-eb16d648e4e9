@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import deque
 from typing import Iterable, Sequence
 
@@ -190,3 +191,84 @@ def compute_bounds(
         # 图强连通且已排除负环，正常情况下不会发生。
         raise RuntimeError("最短路不可达，约束图构造异常")
     return int(min_qualified), int(max_qualified)
+
+
+def _reverse_adjacency(
+    node_count: int, adj: Sequence[Sequence[tuple[int, int]]]
+) -> list[list[tuple[int, int]]]:
+    """反向邻接表：在反向图上从 v 出发求最短路，即得原图上各点到 v 的最短路。"""
+    rev: list[list[tuple[int, int]]] = [[] for _ in range(node_count)]
+    for u in range(node_count):
+        for v, weight in adj[u]:
+            rev[v].append((u, weight))
+    return rev
+
+
+class BoundsIndex:
+    """同一批已提交数据（总片数 + 全部计数）、同一合格下限的复用计算结构。
+
+    构造时只做一次建图和两趟最短路（正向、反向各一趟）；之后对任意合格
+    上限 ``qualified_hi`` 用二分查找定位原子区间即可给出精确上下界，
+    不再回读补报、不再建图、不再跑最短路。上限是否出现在补报端点中
+    不影响精确性。
+
+    原理：合格下限固定，对应前缀变量 S_lo。对任意上限 x，记 f_max(x) =
+    max(S_x - S_lo)、f_min(x) = min(S_x - S_lo)。同一原子区间 (a, b) 内
+    的整数厚度在所有计数约束下等价，且原子内的片可以整体压到 x 之下或
+    抬到 x 及其之上，因此：
+
+    * x 落在原子区间 (a, b) 内时，``f_max(x) = max(S_b - S_lo)``，
+      ``f_min(x) = min(S_a - S_lo)``（b 不存在时取“最后端点之后”的
+      虚拟前缀，即全部片数）；
+    * x 恰好是端点时直接取该端点的前缀差极值。
+
+    端点处的前缀差极值由两趟最短路一次算清：正向最短路给出
+    ``max(S_v - S_lo)``，反向图上的最短路给出 ``max(S_lo - S_v)``，
+    取负即 ``min(S_v - S_lo)``。
+    """
+
+    __slots__ = ("total_count", "qualified_lo", "endpoints", "_max_from_lo", "_max_to_lo")
+
+    def __init__(
+        self,
+        total_count: int,
+        constraints: Sequence[Constraint],
+        qualified_lo: int,
+    ) -> None:
+        if qualified_lo < 0:
+            raise ValueError("合格区间起点必须非负")
+        index, node_count, adj = _build_graph(
+            total_count, constraints, (qualified_lo,)
+        )
+        lo_node = index[qualified_lo] + 1
+        # 端点值 endpoints[j] 对应节点 j+1；节点 m+1 是“最后端点之后”的前缀。
+        self.endpoints = sorted(index)
+        # dist(lo -> v) = max(S_v - S_lo)
+        self._max_from_lo = _shortest_paths(node_count, adj, lo_node)
+        # dist(v -> lo) = max(S_lo - S_v)，在反向图上从 lo 出发求得
+        rev = _reverse_adjacency(node_count, adj)
+        self._max_to_lo = _shortest_paths(node_count, rev, lo_node)
+        self.total_count = total_count
+        self.qualified_lo = qualified_lo
+
+    def query(self, qualified_hi: int) -> tuple[int, int]:
+        """返回合格区间 [qualified_lo, qualified_hi) 片数的最小/最大可达到值。"""
+        if qualified_hi <= self.qualified_lo:
+            raise ValueError("合格区间必须满足 qualified_hi > qualified_lo")
+        endpoints = self.endpoints
+        pos = bisect_left(endpoints, qualified_hi)
+        if pos < len(endpoints) and endpoints[pos] == qualified_hi:
+            node = pos + 1
+            max_count = self._max_from_lo[node]
+            min_count = -self._max_to_lo[node]
+        else:
+            # qualified_hi 落在原子区间 (a, b) 内，或超过最后一个端点。
+            # hi > qualified_lo >= 0 = endpoints[0]，故 pos >= 1。
+            a_node = pos  # endpoints[pos-1] 的节点号
+            b_node = pos + 1  # endpoints[pos] 的节点号，或最后的虚拟前缀节点
+            max_count = self._max_from_lo[b_node]
+            min_count = -self._max_to_lo[a_node]
+        if max_count >= INF or min_count <= -INF:
+            # 图强连通且建索引时已排除负环，正常情况下不会发生。
+            raise RuntimeError("最短路不可达，约束图构造异常")
+        return int(min_count), int(max_count)
